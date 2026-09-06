@@ -1,8 +1,8 @@
 """
 KnowYourCase Backend — FastAPI
 Two endpoints:
-  POST /solve-captcha  — receives raw CAPTCHA PNG bytes, returns solved text
-                         (OpenCV pipeline ported from ecourts/captcha.py)
+  POST /solve-captcha  — receives a CAPTCHA image and returns text using
+                         a local CAPTCHA-specific ONNX model
   POST /parse          — receives raw HTML from WebView + CNR, returns structured JSON
                          (parser ported from ecourts/parsers/case_details.py)
 """
@@ -15,6 +15,7 @@ import base64
 import tempfile
 import os
 import subprocess
+from functools import lru_cache
 from bs4 import BeautifulSoup
 from typing import Optional
 
@@ -24,6 +25,12 @@ try:
     OPENCV_AVAILABLE = True
 except ImportError:
     OPENCV_AVAILABLE = False
+
+try:
+    import ddddocr
+    DDDDOCR_AVAILABLE = True
+except ImportError:
+    DDDDOCR_AVAILABLE = False
 
 app = FastAPI(title="KnowYourCase Parser API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["POST","GET"], allow_headers=["*"])
@@ -74,6 +81,29 @@ class CaseResponse(BaseModel):
 
 CAPTCHA_THRESHOLD = 0.4   # captcha.py: THRESHOLD = 0.4
 MAX_PIXEL_VALUE   = 255   # captcha.py: MAX_PIXEL_VALUE = 255
+
+
+@lru_cache(maxsize=1)
+def _captcha_ocr():
+    if not DDDDOCR_AVAILABLE:
+        return None
+    engine = ddddocr.DdddOcr(show_ad=False)
+    # eCourts CAPTCHAs use lowercase Latin letters and digits.
+    engine.set_ranges(4)
+    return engine
+
+
+def _solve_with_ddddocr(img_bytes: bytes) -> Optional[str]:
+    """Run the free CAPTCHA-specific ONNX model in the Render process."""
+    engine = _captcha_ocr()
+    if engine is None:
+        return None
+    try:
+        text = engine.classification(img_bytes)
+        clean = re.sub(r"[^A-Za-z0-9]", "", text or "")
+        return clean.upper() if len(clean) in (5, 6) else None
+    except Exception:
+        return None
 
 def _decaptcha_opencv(img_bytes: bytes) -> Optional[str]:
     """
@@ -277,7 +307,12 @@ def parse_ecourts_html(cnr: str, html: str) -> CaseResponse:
 
 @app.get("/")
 def root():
-    return {"service":"KnowYourCase Parser API","status":"ok","opencv":OPENCV_AVAILABLE}
+    return {
+        "service": "KnowYourCase Parser API",
+        "status": "ok",
+        "captcha_solver": "ddddocr" if DDDDOCR_AVAILABLE else "tesseract-fallback",
+        "opencv": OPENCV_AVAILABLE,
+    }
 
 @app.get("/health")
 def health():
@@ -286,18 +321,20 @@ def health():
 @app.post("/solve-captcha", response_model=CaptchaResponse)
 def solve_captcha(req: CaptchaRequest):
     """
-    Accepts base64-encoded CAPTCHA image. Returns solved text via OpenCV+Tesseract
-    pipeline ported from ecourts/captcha.py (captn3m0).
+    Accepts a base64 CAPTCHA image. Uses ddddocr first, with the legacy
+    OpenCV/Tesseract pipeline as a fallback.
     """
     try:
         img_bytes = base64.b64decode(req.image_b64)
     except Exception:
         raise HTTPException(400, "Invalid base64 image")
-    if not OPENCV_AVAILABLE:
-        return CaptchaResponse(solved=None, confidence="failed")
-    solved = _decaptcha_opencv(img_bytes)
+    solved = _solve_with_ddddocr(img_bytes)
     if solved:
-        return CaptchaResponse(solved=solved, confidence="high" if len(solved)==5 else "low")
+        return CaptchaResponse(solved=solved, confidence="high")
+
+    solved = _decaptcha_opencv(img_bytes) if OPENCV_AVAILABLE else None
+    if solved:
+        return CaptchaResponse(solved=solved, confidence="low")
     return CaptchaResponse(solved=None, confidence="failed")
 
 @app.post("/parse", response_model=CaseResponse)

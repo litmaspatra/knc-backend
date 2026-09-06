@@ -5,3 +5,4 @@ beautifulsoup4==4.12.3
 html5lib==1.1
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
+ddddocr==1.6.1
