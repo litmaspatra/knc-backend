@@ -249,9 +249,9 @@ def parse_ecourts_html(cnr: str, html: str) -> CaseResponse:
 
     # ── Parties (mirrors extract_parties from case_details.py) ───────────
     def get_party(cls_name):
-        span = soup.find("span", class_=cls_name)
+        span = soup.find(class_=cls_name)
         if not span:
-            for s in soup.find_all("span"):
+            for s in soup.find_all(True):
                 if cls_name.lower() in " ".join(s.get("class",[])).lower():
                     span = s; break
         if not span: return None, None
