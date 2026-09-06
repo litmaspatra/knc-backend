@@ -101,7 +101,7 @@ def _solve_with_ddddocr(img_bytes: bytes) -> Optional[str]:
     try:
         text = engine.classification(img_bytes)
         clean = re.sub(r"[^A-Za-z0-9]", "", text or "")
-        return clean.upper() if len(clean) in (5, 6) else None
+        return clean.lower() if len(clean) == 6 else None
     except Exception:
         return None
 
