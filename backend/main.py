@@ -87,7 +87,9 @@ MAX_PIXEL_VALUE   = 255   # captcha.py: MAX_PIXEL_VALUE = 255
 def _captcha_ocr():
     if not DDDDOCR_AVAILABLE:
         return None
-    engine = ddddocr.DdddOcr(show_ad=False)
+    # The beta model is the newer bundled network and performs better on
+    # distorted/noisy CAPTCHAs such as the eCourts image.
+    engine = ddddocr.DdddOcr(beta=True, show_ad=False)
     # eCourts CAPTCHAs use lowercase Latin letters and digits.
     engine.set_ranges(4)
     return engine
