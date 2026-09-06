@@ -71,6 +71,7 @@ class CaseResponse(BaseModel):
     respondent: Optional[str] = None
     petitioner_advocate: Optional[str] = None
     respondent_advocate: Optional[str] = None
+    acts_and_sections: list = []
     status: Optional[str] = None
     nature_of_disposal: Optional[str] = None
     judges: list = []
@@ -203,28 +204,38 @@ def parse_ecourts_html(cnr: str, html: str) -> CaseResponse:
     filled = 0
 
     # ── Row-based extraction (works for both district and HC layouts) ─────
-    for row in soup.find_all("tr"):
-        cells = row.find_all(["td","th"])
-        if len(cells) < 2: continue
-        key = _t(cells[0]).lower()
-        val = _t(cells[-1])
-        if not val or len(val) > 300: continue
-        if   "case type"            in key: r.case_type = val; filled += 1
-        elif "filing number"        in key or "filing no" in key: r.filing_number = val; filled += 1
-        elif "filing date"          in key: r.filing_date = _dt(val); filled += 1
-        elif "registration number"  in key or "registration no" in key: r.registration_number = val; filled += 1
-        elif "registration date"    in key: r.registration_date = _dt(val); filled += 1
+    def apply_field(key: str, val: str) -> None:
+        nonlocal filled
+        key = re.sub(r"\s+", " ", key).strip().lower()
+        val = re.sub(r"\s+", " ", val).strip()
+        if not val or len(val) > 300:
+            return
+        if "e-filing" in key or "e filing" in key:
+            return
+        if   "case type"            in key and not r.case_type: r.case_type = val; filled += 1
+        elif ("filing number"       in key or "filing no" in key) and not r.filing_number: r.filing_number = val; filled += 1
+        elif "filing date"          in key and not r.filing_date: r.filing_date = _dt(val); filled += 1
+        elif ("registration number" in key or "registration no" in key) and not r.registration_number: r.registration_number = val; filled += 1
+        elif "registration date"    in key and not r.registration_date: r.registration_date = _dt(val); filled += 1
         elif "court name"           in key and not r.court_name: r.court_name = val; filled += 1
         elif "case no"              in key and not r.case_number: r.case_number = val; filled += 1
         elif "first hearing"        in key: r.first_hearing_date = _dt(val); filled += 1
         elif "decision date"        in key: r.decision_date = _dt(val); filled += 1
-        elif "case status"          in key or "stage of case" in key:
+        elif "case status"          in key or "stage of case" in key or "case stage" in key:
             if not r.status: r.status = val; filled += 1
         elif "nature of disposal"   in key: r.nature_of_disposal = val; filled += 1
         elif "coram"                in key or ("judge" in key and "next" not in key):
             if not r.judges: r.judges = [v.strip() for v in val.split(",") if v.strip()]; filled += 1
         elif "not before me"        in key or "next hearing" in key or "next date" in key:
             if not r.next_hearing_date: r.next_hearing_date = _dt(val); filled += 1
+
+    # A single eCourts row often contains multiple label/value pairs.
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["td", "th"], recursive=False)
+        if len(cells) < 2:
+            cells = row.find_all(["td", "th"])
+        for index in range(0, len(cells) - 1, 2):
+            apply_field(_t(cells[index]), _t(cells[index + 1]))
 
     # ── Span/label pairs (mirrors extract_span_label_dict from case_details.py) ──
     KEYS = ["Number","Station","District","Year","State","Type","Date","Status","Court","Name"]
@@ -255,15 +266,26 @@ def parse_ecourts_html(cnr: str, html: str) -> CaseResponse:
                 if cls_name.lower() in " ".join(s.get("class",[])).lower():
                     span = s; break
         if not span: return None, None
-        txt = span.get_text(separator="\n",strip=True).replace("\xa0","")
-        name = adv = None
+        txt = span.get_text(separator="\n", strip=True).replace("\xa0", " ")
+        names = []
+        advocates = []
         for line in txt.split("\n"):
-            line = line.strip()
-            m = re.match(r"^\d+\)\s*(.+)", line)
-            if m and not name:            name = m.group(1).strip()
-            elif re.search(r"advocate\s*[-–]", line, re.I) and not adv:
-                adv = re.split(r"advocate\s*[-–]", line, flags=re.I)[-1].strip()
-        return name, adv
+            line = re.sub(r"\s+", " ", line).strip()
+            if not line:
+                continue
+            party_match = re.match(r"^\d+[.)]\s*(.+)", line)
+            advocate_match = re.search(r"advocate\s*[-–:]\s*(.+)", line, re.I)
+            if party_match:
+                party_name = re.split(
+                    r"\s+advocate\s*[-–:]", party_match.group(1), flags=re.I
+                )[0].strip()
+                if party_name and party_name not in names:
+                    names.append(party_name)
+            if advocate_match:
+                advocate = advocate_match.group(1).strip()
+                if advocate and advocate not in advocates:
+                    advocates.append(advocate)
+        return "\n".join(names) or None, "\n".join(advocates) or None
 
     pn, pa = get_party("Petitioner_Advocate_table")
     rn, ra = get_party("Respondent_Advocate_table")
@@ -271,6 +293,19 @@ def parse_ecourts_html(cnr: str, html: str) -> CaseResponse:
     if pa: r.petitioner_advocate = pa; filled += 1
     if rn: r.respondent = rn; filled += 1
     if ra: r.respondent_advocate = ra; filled += 1
+
+    acts_table = soup.find("table", id="act_table") or soup.find("table", class_="acts_table")
+    if acts_table:
+        for row in acts_table.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            act = _t(cells[0])
+            sections = _t(cells[1])
+            if act or sections:
+                r.acts_and_sections.append({"act": act or None, "sections": sections or None})
+        if r.acts_and_sections:
+            filled += 1
 
     # Case title
     if r.petitioner and r.respondent:
