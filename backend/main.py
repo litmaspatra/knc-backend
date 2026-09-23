@@ -19,18 +19,7 @@ from functools import lru_cache
 from bs4 import BeautifulSoup
 from typing import Optional
 
-try:
-    import cv2
-    import numpy as np
-    OPENCV_AVAILABLE = True
-except ImportError:
-    OPENCV_AVAILABLE = False
-
-try:
-    import ddddocr
-    DDDDOCR_AVAILABLE = True
-except ImportError:
-    DDDDOCR_AVAILABLE = False
+import ddddocr
 
 app = FastAPI(title="KnowYourCase Parser API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["POST","GET"], allow_headers=["*"])
@@ -78,110 +67,24 @@ class CaseResponse(BaseModel):
     hearings: list = []
     data_completeness: str = "partial"
 
-# ── CAPTCHA solver (ported 1:1 from ecourts/captcha.py by captn3m0) ──────────
-
-CAPTCHA_THRESHOLD = 0.4   # captcha.py: THRESHOLD = 0.4
-MAX_PIXEL_VALUE   = 255   # captcha.py: MAX_PIXEL_VALUE = 255
-
+# ── CAPTCHA solver ─────────────────────────────────────────────────────────────
 
 @lru_cache(maxsize=1)
 def _captcha_ocr():
-    if not DDDDOCR_AVAILABLE:
-        return None
-    # The beta model is the newer bundled network and performs better on
-    # distorted/noisy CAPTCHAs such as the eCourts image.
+    # eCourts CAPTCHAs contain only lowercase Latin letters and digits.
+    # ddddocr range 4 = lowercase a-z + digits 0-9.
     engine = ddddocr.DdddOcr(beta=True, show_ad=False)
-    # eCourts CAPTCHAs use lowercase Latin letters and digits.
     engine.set_ranges(4)
     return engine
 
 
 def _solve_with_ddddocr(img_bytes: bytes) -> Optional[str]:
-    """Run the free CAPTCHA-specific ONNX model in the Render process."""
-    engine = _captcha_ocr()
-    if engine is None:
-        return None
+    """Solve the six-character eCourts CAPTCHA with the local ONNX model."""
     try:
-        text = engine.classification(img_bytes)
-        clean = re.sub(r"[^A-Za-z0-9]", "", text or "")
-        return clean.lower() if len(clean) == 6 else None
+        text = _captcha_ocr().classification(img_bytes)
+        clean = re.sub(r"[^a-z0-9]", "", (text or "").lower())
+        return clean if len(clean) == 6 else None
     except Exception:
-        return None
-
-def _decaptcha_opencv(img_bytes: bytes) -> Optional[str]:
-    """
-    Direct port of Captcha.decaptcha() from ecourts/captcha.py.
-    Steps mirror the original exactly, including the crop [15:65, 27:190].
-    """
-    if not OPENCV_AVAILABLE:
-        return None
-    nparr = np.frombuffer(img_bytes, np.uint8)
-    src = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if src is None:
-        return None
-
-    threshold_val = int(MAX_PIXEL_VALUE * CAPTCHA_THRESHOLD)
-
-    # 1. Binary threshold
-    _, threshold_img = cv2.threshold(src, threshold_val, MAX_PIXEL_VALUE, cv2.THRESH_BINARY)
-
-    # 2. Mask for grey noise lines (colour #707070 from captcha.py)
-    lines_color = np.array([0x70, 0x70, 0x70], dtype=np.uint8)
-    binary_mask = cv2.inRange(src, lines_color, lines_color)
-    masked = cv2.bitwise_and(src, src, mask=binary_mask)
-
-    # 3. Dilate mask lines
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    masked = cv2.dilate(masked, kernel)
-
-    # 4. Inpaint (remove noise lines) — captcha.py: cv2.inpaint(..., 7, cv2.INPAINT_NS)
-    masked_gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
-    dst = cv2.inpaint(threshold_img, masked_gray, 7, cv2.INPAINT_NS)
-
-    # 5. Dilate small remaining lines
-    dst = cv2.dilate(dst, kernel)
-
-    # 6. Gaussian blur + bilateral filter
-    dst = cv2.GaussianBlur(dst, (5, 5), 0)
-    dst = cv2.bilateralFilter(dst, 5, 75, 75)
-
-    # 7. Grayscale + Otsu threshold
-    dst = cv2.cvtColor(dst, cv2.COLOR_BGR2GRAY)
-    _, dst = cv2.threshold(dst, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 8. Crop to text region — EXACT from captcha.py line 68
-    dst = dst[15:65, 27:190]
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp_path = f.name
-    cv2.imwrite(tmp_path, dst)
-    try:
-        return _run_tesseract(tmp_path)
-    finally:
-        try: os.unlink(tmp_path)
-        except: pass
-
-def _run_tesseract(image_path: str) -> Optional[str]:
-    """
-    Mirrors captcha.py Popen call:
-      tesseract <file> stdout --oem 1 --psm 8 -c tessedit_char_whitelist=abc...0-9
-    captcha.py validates len==5; we relax to 4-6 for district courts.
-    """
-    try:
-        proc = subprocess.Popen(
-            ["tesseract", image_path, "stdout",
-             "--oem", "1", "--psm", "8",
-             "-c", "tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyz0123456789"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        proc.wait(timeout=10)
-        out, _ = proc.communicate()
-        text = out.decode("utf-8").strip()
-        clean = re.sub(r"\s+", "", text)
-        if 4 <= len(clean) <= 6:
-            return clean
-        return None
-    except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
 
 # ── HTML parser (ported from ecourts/parsers/case_details.py) ─────────────────
@@ -347,8 +250,8 @@ def root():
     return {
         "service": "KnowYourCase Parser API",
         "status": "ok",
-        "captcha_solver": "ddddocr" if DDDDOCR_AVAILABLE else "tesseract-fallback",
-        "opencv": OPENCV_AVAILABLE,
+        "captcha_solver": "ddddocr",
+        "captcha_charset": "a-z0-9",
     }
 
 @app.get("/health")
@@ -358,8 +261,8 @@ def health():
 @app.post("/solve-captcha", response_model=CaptchaResponse)
 def solve_captcha(req: CaptchaRequest):
     """
-    Accepts a base64 CAPTCHA image. Uses ddddocr first, with the legacy
-    OpenCV/Tesseract pipeline as a fallback.
+    Accepts a base64 CAPTCHA image and solves it with ddddocr.
+    Valid results are exactly six lowercase letters/digits.
     """
     try:
         img_bytes = base64.b64decode(req.image_b64)
@@ -368,10 +271,6 @@ def solve_captcha(req: CaptchaRequest):
     solved = _solve_with_ddddocr(img_bytes)
     if solved:
         return CaptchaResponse(solved=solved, confidence="high")
-
-    solved = _decaptcha_opencv(img_bytes) if OPENCV_AVAILABLE else None
-    if solved:
-        return CaptchaResponse(solved=solved, confidence="low")
     return CaptchaResponse(solved=None, confidence="failed")
 
 @app.post("/parse", response_model=CaseResponse)
