@@ -6,25 +6,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Native dependencies:
-# - tesseract-ocr: fallback CAPTCHA OCR used by main.py
-# - libgomp1: required by ONNX/OpenCV native wheels
-# - libglib2.0-0: common runtime dependency for OpenCV
+# ddddocr/onnxruntime only needs the OpenMP runtime here.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        tesseract-ocr \
-        libgomp1 \
-        libglib2.0-0 \
+    && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/main.py ./main.py
 
-# blitz.cloud runs containers without root privileges. Using UID/GID 1000
-# also keeps this image compatible with its Docker-image deployment path.
 RUN groupadd --gid 1000 appuser \
     && useradd --uid 1000 --gid 1000 --create-home appuser \
     && chown -R appuser:appuser /app
