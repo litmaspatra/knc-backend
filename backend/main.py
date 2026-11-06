@@ -6,23 +6,66 @@ Two endpoints:
   POST /parse          — receives raw HTML from WebView + CNR, returns structured JSON
                          (parser ported from ecourts/parsers/case_details.py)
 """
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import re
-import datetime
 import base64
-import tempfile
+import datetime
+import hmac
 import os
-import subprocess
+import re
+import sys
 from functools import lru_cache
-from bs4 import BeautifulSoup
 from typing import Optional
 
 import ddddocr
+from bs4 import BeautifulSoup
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
-app = FastAPI(title="KnowYourCase Parser API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["POST","GET"], allow_headers=["*"])
+# ── Startup: validate API_KEY ──────────────────────────────────────────────────
+
+_API_KEY: str = os.environ.get("API_KEY", "")
+if len(_API_KEY) < 16:
+    sys.exit(
+        "FATAL: API_KEY environment variable is missing or shorter than 16 characters. "
+        "Set a strong secret before starting the server."
+    )
+
+# ── Rate limiter — uses X-Forwarded-For when behind a proxy ───────────────────
+
+def _client_ip(request: Request) -> str:
+    """Return the real client IP from X-Forwarded-For (set by proxy) or the
+    direct socket address as a fallback."""
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        # Header may contain a comma-separated chain; first entry is the client.
+        return forwarded_for.split(",")[0].strip()
+    return get_remote_address(request)
+
+limiter = Limiter(key_func=_client_ip)
+
+# ── FastAPI app — docs disabled in production ──────────────────────────────────
+
+app = FastAPI(
+    title="KnowYourCase Parser API",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ── Auth dependency ────────────────────────────────────────────────────────────
+
+def _require_api_key(request: Request) -> None:
+    """FastAPI dependency — rejects any request whose X-API-Key header does not
+    match the server's API_KEY.  Uses hmac.compare_digest to prevent
+    timing-based key enumeration."""
+    client_key = request.headers.get("X-API-Key", "")
+    if not hmac.compare_digest(client_key.encode(), _API_KEY.encode()):
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
@@ -250,20 +293,25 @@ def root():
     return {
         "service": "KnowYourCase Parser API",
         "status": "ok",
-        "captcha_solver": "ddddocr",
-        "captcha_charset": "a-z0-9",
     }
 
 @app.get("/health")
 def health():
-    return {"status":"ok"}
+    return {"status": "ok"}
 
 @app.post("/solve-captcha", response_model=CaptchaResponse)
-def solve_captcha(req: CaptchaRequest):
+@limiter.limit("30/minute")
+def solve_captcha(
+    request: Request,
+    req: CaptchaRequest,
+    _: None = Depends(_require_api_key),
+):
     """
     Accepts a base64 CAPTCHA image and solves it with ddddocr.
     Valid results are exactly six lowercase letters/digits.
     """
+    if len(req.image_b64) > 1_000_000:
+        raise HTTPException(status_code=413, detail="image_b64 exceeds 1,000,000 character limit")
     try:
         img_bytes = base64.b64decode(req.image_b64)
     except Exception:
@@ -274,11 +322,18 @@ def solve_captcha(req: CaptchaRequest):
     return CaptchaResponse(solved=None, confidence="failed")
 
 @app.post("/parse", response_model=CaseResponse)
-def parse_case(req: ParseRequest):
+@limiter.limit("30/minute")
+def parse_case(
+    request: Request,
+    req: ParseRequest,
+    _: None = Depends(_require_api_key),
+):
     """
     Accepts raw eCourts result HTML captured by the Android WebView + CNR.
     Returns structured case data using ecourts/parsers/case_details.py logic.
     """
+    if len(req.html) > 5_000_000:
+        raise HTTPException(status_code=413, detail="html exceeds 5,000,000 character limit")
     cnr = req.cnr.strip().replace("-","").upper()
     if len(cnr) != 16:
         raise HTTPException(400, "Invalid CNR: must be 16 characters")
